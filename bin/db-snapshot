@@ -1,0 +1,41 @@
+#!/usr/bin/env bash
+
+set -euxo pipefail
+
+SCRIPT_DIR=$( cd -- "$( dirname -- "${BASH_SOURCE[0]}" )" &> /dev/null && pwd )
+cd "$SCRIPT_DIR/.."
+
+BORG_REPO="/usr/local/bak/db-backups"
+
+function borg {
+  if [[ -f /bin/borg ]]; then
+    /bin/borg $@
+  else
+    distrobox-host-exec borg $@
+  fi
+}
+
+function borg_snapshot {
+  borg create --stats $BORG_REPO::{now} ./
+  borg prune --stats $BORG_REPO --keep-within=3d --keep-daily=14
+  borg compact $BORG_REPO
+}
+
+function get_databases {
+  psql postgres --csv -c "SELECT datname FROM pg_database where datdba = regrole('$USER');" | tail -n +2
+}
+
+function dump_db {
+  database=$1
+  pg_dump $database | zstd > "$database.sql.zst"
+}
+
+function dump_all {
+  databases=$(get_databases)
+  for database in $databases; do
+    dump_db $database
+  done
+}
+
+dump_all
+borg_snapshot

@@ -1,0 +1,113 @@
+#!/usr/bin/env bash
+
+set -euxo pipefail
+
+SCRIPT_DIR=$( cd -- "$( dirname -- "${BASH_SOURCE[0]}" )" &> /dev/null && pwd )
+cd "$SCRIPT_DIR/.."
+
+BORG_REPO="/usr/local/bak/db-backups"
+INTERFACE="$(test -t 0 && echo cli || echo gui)"
+
+function borg {
+  if [[ -f /bin/borg ]]; then
+    /bin/borg $@
+  else
+    distrobox-host-exec borg $@
+  fi
+}
+
+function backup_db_after_restore {
+  snapshot=$1
+  database=$2
+  dump_db $database
+  borg_snapshot $database:after_restore:$snapshot
+}
+
+function backup_db_before_drop {
+  database=$1
+  dump_db $database
+  borg_snapshot $database:before_drop
+}
+
+function borg_snapshot {
+  name=$1
+  borg create --stats $BORG_REPO::{now}-$name ./
+}
+
+function create_db {
+  database=$1
+  createdb --owner=$USER $database
+}
+
+function dump_db {
+  database=$1
+  pg_dump $database | zstd > "$database.sql.zst"
+}
+
+function drop_db {
+  database=$1
+  psql postgres -c "DROP database $database;"
+}
+
+function get_databases {
+  psql postgres --csv -c "SELECT datname FROM pg_database where datdba = regrole('$USER');" | tail -n +2
+}
+
+function get_export {
+  snapshot=$1
+  database=$2
+  borg extract $BORG_REPO::$snapshot $database.sql.zst --stdout | zstd -d
+}
+
+function get_choice_input {
+  LABEL_TITLE="db-restore-snapshot:$1"
+  if test "$INTERFACE" = "cli"; then
+    cat | fzf --layout reverse --border top --border-label="$LABEL_TITLE"
+  elif test "$INTERFACE" = "gui"; then
+    fuzzel -d --prompt "$LABEL_TITLE ❯ "
+  fi
+}
+
+function list_borg_backups {
+  borg list $BORG_REPO | awk '{ print $1 }' | tac
+}
+
+function list_databases_in_snapshot {
+  snapshot=$1
+  borg list --short $BORG_REPO::$snapshot | grep '.sql.zst' | sed 's/\.sql\.zst//g' | sort
+}
+
+function restore_snapshot {
+  snapshot=$1
+  database=$2
+  get_export $snapshot $database | psql $database
+}
+
+function select_borg_snapshot {
+  list_borg_backups | get_choice_input 'select borg snapshot'
+}
+
+function select_db_in_snapshot {
+  snapshot=$1
+  list_databases_in_snapshot $snapshot | get_choice_input 'select database'
+}
+
+snapshot=$(select_borg_snapshot)
+database=$(select_db_in_snapshot $snapshot || echo "none")
+while [[ "$database" == "none" ]]; do
+  snapshot=$(select_borg_snapshot)
+  database=$(select_db_in_snapshot $snapshot || echo "none")
+done
+existing_databases="$(get_databases)"
+database_exists=$(echo "$existing_databases" | grep $database)
+if test -n "$database_exists"; then
+  # backup_db_before_drop $database
+  drop_db $database
+  create_db $database
+else
+  create_db $database
+fi
+# notify-send db-restore-snapshot "restoring: $snapshot $database"
+restore_snapshot $snapshot $database
+# backup_db_after_restore $snapshot $database
+# notify-send db-restore-snapshot "complete: $snapshot $database"
