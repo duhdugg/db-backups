@@ -1,0 +1,49 @@
+#!/usr/bin/env bash
+
+set -euxo pipefail
+
+SCRIPT_DIR=$( cd -- "$( dirname -- "${BASH_SOURCE[0]}" )" &> /dev/null && pwd )
+cd "$SCRIPT_DIR/.."
+
+BORG_REPO="/usr/local/bak/db-backups"
+INTERFACE="$(test -t 0 && echo cli || echo gui)"
+
+function borg {
+  if [[ -f /bin/borg ]]; then
+    /bin/borg $@
+  else
+    distrobox-host-exec borg $@
+  fi
+}
+
+function get_databases {
+  psql postgres --csv -c "SELECT datname FROM pg_database where datdba = regrole('$USER');" | tail -n +2
+}
+
+function get_choice_input {
+  LABEL_TITLE="db-rename-snapshot:$1"
+  if test "$INTERFACE" = "cli"; then
+    cat | fzf --layout reverse --border top --border-label="$LABEL_TITLE"
+  elif test "$INTERFACE" = "gui"; then
+    fuzzel -d --prompt "$LABEL_TITLE ❯ "
+  fi
+}
+
+function list_borg_backups {
+  borg list $BORG_REPO | awk '{ print $1 }' | tac
+}
+
+function select_borg_snapshot {
+  list_borg_backups | get_choice_input 'select borg snapshot'
+}
+
+function get_new_name {
+  name=$1
+  read -p "Enter new name: " -i "$name" -e new_name
+  echo "$new_name" | sed 's/\s/-/g'
+}
+
+snapshot=$(select_borg_snapshot)
+echo "Current name: $snapshot"
+new_name=$(get_new_name "$snapshot")
+borg rename "$BORG_REPO::$snapshot" "$new_name"
